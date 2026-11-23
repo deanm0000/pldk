@@ -31,6 +31,35 @@ def test_snapshot_and_inline_visibility(lake):
         conn.scan_table("items", 999)
 
 
+def test_catalog_format_1_0(lake):
+    lake.db.execute("UPDATE ducklake_metadata SET value='1.0' WHERE key='version'")
+    lake.db.execute("ALTER TABLE ducklake_schema DROP COLUMN parent_schema_id")
+    lake.db.execute("ALTER TABLE ducklake_table_column_stats DROP COLUMN min_is_exact")
+    lake.db.execute("ALTER TABLE ducklake_table_column_stats DROP COLUMN max_is_exact")
+    lake.db.execute(
+        "ALTER TABLE ducklake_inlined_data_1_1 "
+        "RENAME COLUMN _ducklake_row_id TO row_id"
+    )
+    lake.db.execute(
+        "ALTER TABLE ducklake_inlined_data_1_1 "
+        "RENAME COLUMN _ducklake_begin_snapshot TO begin_snapshot"
+    )
+    lake.db.execute(
+        "ALTER TABLE ducklake_inlined_data_1_1 "
+        "RENAME COLUMN _ducklake_end_snapshot TO end_snapshot"
+    )
+    lake.db.execute(
+        "INSERT INTO ducklake_inlined_data_1_1 VALUES "
+        "(1,1,NULL,7,convert_to('inline','UTF8'))"
+    )
+
+    conn = connect(lake)
+    assert conn.scan_table("items").collect().row(0) == (7, "inline")
+    stats = conn.get_stats("items")
+    assert stats["min_is_exact"].to_list() == [None, None]
+    assert stats["max_is_exact"].to_list() == [None, None]
+
+
 def test_pruning_proven_by_unreadable_blob(lake):
     lake.file(1, [1, 2], upload=False)
     lake.file(2, [10, 11])

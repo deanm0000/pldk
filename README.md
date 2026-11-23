@@ -7,7 +7,7 @@ Python package nor its Rust library depends on DuckDB.
 ## Compatibility
 
 - Python 3.11+ and **Polars 2.1.0**.
-- DuckLake catalog format **1.1** on PostgreSQL.
+- DuckLake catalog formats **1.0 and 1.1** on PostgreSQL.
 - Polars and `pyo3-polars` are pinned to the Python release's
   [Git commit](https://github.com/pola-rs/polars/commit/7f902bd3ffd27ff82d14278a09a295ff2f7aed92).
   The matching Rust toolchain and upstream hashbrown patch are pinned too.

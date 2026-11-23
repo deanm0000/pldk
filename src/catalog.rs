@@ -15,6 +15,17 @@ fn db(error: sqlx::Error) -> String {
     format!("PostgreSQL catalog query failed: {error}")
 }
 
+fn inline_system_columns(version: FormatVersion) -> (&'static str, &'static str, &'static str) {
+    match version {
+        FormatVersion::V1_0 => ("row_id", "begin_snapshot", "end_snapshot"),
+        FormatVersion::V1_1 => (
+            "_ducklake_row_id",
+            "_ducklake_begin_snapshot",
+            "_ducklake_end_snapshot",
+        ),
+    }
+}
+
 pub(crate) fn quote(name: &str) -> String {
     // TODO(mysql): use backtick identifier quoting.
     format!("\"{}\"", name.replace('"', "\"\""))
@@ -71,6 +82,13 @@ pub(crate) struct Catalog {
     pool: PgPool,
     inline_tables: Mutex<InlineCache>,
     pub storage: Storage,
+    format_version: FormatVersion,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FormatVersion {
+    V1_0,
+    V1_1,
 }
 
 struct InlineCache {
@@ -128,9 +146,16 @@ impl Catalog {
         .fetch_one(&mut *connection)
         .await
         .map_err(db)?;
-        if metadata.try_get::<String, _>("value").map_err(db)? != "1.1" {
-            return Err("Only DuckLake catalog format 1.1 is supported".into());
-        }
+        let version: String = metadata.try_get("value").map_err(db)?;
+        let format_version = match version.as_str() {
+            "1.0" => FormatVersion::V1_0,
+            "1.1" => FormatVersion::V1_1,
+            _ => {
+                return Err(format!(
+                    "Only DuckLake catalog formats 1.0 and 1.1 are supported (found {version})"
+                ));
+            }
+        };
         let snapshot = metadata.try_get("snapshot").map_err(db)?;
         let inline = inline_tables(&mut connection).await?;
         connection.commit().await.map_err(db)?;
@@ -141,6 +166,7 @@ impl Catalog {
                 tables: inline,
             }),
             storage: Storage::new(key),
+            format_version,
         })
     }
 
@@ -176,7 +202,7 @@ impl Catalog {
             .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .await
             .map_err(db)?;
-        let table = table(&mut tx, name, requested).await?;
+        let table = table(&mut tx, name, requested, self.format_version).await?;
         let snapshot: i64 = table.try_get("snapshot_id").map_err(db)?;
         let table_id: i64 = table.try_get("table_id").map_err(db)?;
         let columns = columns(&mut tx, table_id, snapshot).await?;
@@ -334,6 +360,8 @@ impl Catalog {
         let inline_mapping = self
             .inline_mapping(&mut tx, table.try_get("latest_snapshot").map_err(db)?)
             .await?;
+        let (inline_row_id, inline_begin_snapshot, inline_end_snapshot) =
+            inline_system_columns(self.format_version);
         let mut inline = Vec::new();
         let mut inline_queries = Vec::new();
         for entry in inline_mapping.iter().filter(|e| e.table_id == table_id) {
@@ -368,10 +396,13 @@ impl Catalog {
                 .collect::<Vec<_>>()
                 .join(", ");
             inline_queries.push(format!(
-                "(SELECT {expressions} FROM {} WHERE _ducklake_begin_snapshot <= $1
-                 AND (_ducklake_end_snapshot > $1 OR _ducklake_end_snapshot IS NULL)
-                 ORDER BY _ducklake_row_id)",
+                "(SELECT {expressions} FROM {} WHERE {inline_begin_snapshot} <= $1
+                 AND ({inline_end_snapshot} > $1 OR {inline_end_snapshot} IS NULL)
+                 ORDER BY {inline_row_id})",
                 quote(&entry.name),
+                inline_begin_snapshot = quote(inline_begin_snapshot),
+                inline_end_snapshot = quote(inline_end_snapshot),
+                inline_row_id = quote(inline_row_id),
             ));
         }
         if !inline_queries.is_empty() {
@@ -422,19 +453,23 @@ impl Catalog {
             .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .await
             .map_err(db)?;
-        let t = table(&mut tx, name, None).await?;
+        let t = table(&mut tx, name, None, self.format_version).await?;
         let snapshot: i64 = t.try_get("snapshot_id").map_err(db)?;
         let id: i64 = t.try_get("table_id").map_err(db)?;
-        let rows = sqlx::query(
+        let exactness_columns = match self.format_version {
+            FormatVersion::V1_0 => "NULL::boolean AS min_is_exact, NULL::boolean AS max_is_exact",
+            FormatVersion::V1_1 => "s.min_is_exact, s.max_is_exact",
+        };
+        let rows = sqlx::query(&format!(
             "SELECT c.column_id, c.column_name, c.initial_default,
                     s.min_value, s.max_value, s.contains_null, s.contains_nan,
-                    s.extra_stats, s.min_is_exact, s.max_is_exact
+                    s.extra_stats, {exactness_columns}
              FROM ducklake_column c LEFT JOIN ducklake_table_column_stats s
                ON c.table_id = s.table_id AND c.column_id = s.column_id
              WHERE c.table_id = $1 AND c.parent_column IS NULL AND c.begin_snapshot <= $2
                AND (c.end_snapshot > $2 OR c.end_snapshot IS NULL)
-             ORDER BY c.column_order",
-        )
+             ORDER BY c.column_order"
+        ))
         .bind(id)
         .bind(snapshot)
         .fetch_all(&mut *tx)
@@ -469,6 +504,8 @@ impl Catalog {
             .map(|(id, _)| id.to_string())
             .collect::<Vec<_>>()
             .join(",");
+        let (_, inline_begin_snapshot, inline_end_snapshot) =
+            inline_system_columns(self.format_version);
         let inline_queries = mappings
             .iter()
             .filter(|e| e.table_id == id)
@@ -488,9 +525,11 @@ impl Catalog {
                 format!(
                     "SELECT unnest(ARRAY[{ids}]::bigint[]) AS column_id,
                         unnest(ARRAY[{counts}]::bigint[]) AS null_count
-                 FROM {} WHERE _ducklake_begin_snapshot <= $2
-                   AND (_ducklake_end_snapshot > $2 OR _ducklake_end_snapshot IS NULL)",
+                 FROM {} WHERE {inline_begin_snapshot} <= $2
+                   AND ({inline_end_snapshot} > $2 OR {inline_end_snapshot} IS NULL)",
                     quote(&entry.name),
+                    inline_begin_snapshot = quote(inline_begin_snapshot),
+                    inline_end_snapshot = quote(inline_end_snapshot),
                 )
             })
             .collect::<Vec<_>>();
@@ -554,26 +593,44 @@ impl Catalog {
     }
 }
 
-async fn table(connection: &mut PgConnection, name: &str, snapshot: Option<i64>) -> Result<PgRow> {
+async fn table(
+    connection: &mut PgConnection,
+    name: &str,
+    snapshot: Option<i64>,
+    format_version: FormatVersion,
+) -> Result<PgRow> {
     // TODO(mysql, sqlite): replace to_regclass and PostgreSQL parameter/cast syntax.
-    let rows = sqlx::query(
+    let schemas = match format_version {
+        FormatVersion::V1_0 => {
+            "schemas AS (
+               SELECT schema_id, schema_name::text AS full_name, path, path_is_relative
+               FROM ducklake_schema CROSS JOIN chosen_snapshot v
+               WHERE begin_snapshot <= v.snapshot_id
+                 AND (end_snapshot > v.snapshot_id OR end_snapshot IS NULL)
+             )"
+        }
+        FormatVersion::V1_1 => {
+            "schemas AS (
+               SELECT schema_id, schema_name::text AS full_name, path, path_is_relative
+               FROM ducklake_schema CROSS JOIN chosen_snapshot v
+               WHERE parent_schema_id IS NULL AND begin_snapshot <= v.snapshot_id
+                 AND (end_snapshot > v.snapshot_id OR end_snapshot IS NULL)
+               UNION ALL
+               SELECT s.schema_id, p.full_name || '.' || s.schema_name, s.path, s.path_is_relative
+               FROM ducklake_schema s JOIN schemas p ON s.parent_schema_id = p.schema_id
+               CROSS JOIN chosen_snapshot v
+               WHERE s.begin_snapshot <= v.snapshot_id
+                 AND (s.end_snapshot > v.snapshot_id OR s.end_snapshot IS NULL)
+             )"
+        }
+    };
+    let rows = sqlx::query(&format!(
         "WITH RECURSIVE latest AS (
            SELECT max(snapshot_id) AS latest_snapshot FROM ducklake_snapshot
          ), chosen_snapshot AS (
            SELECT snapshot_id, latest_snapshot FROM ducklake_snapshot CROSS JOIN latest
            WHERE snapshot_id = coalesce($2::bigint, latest_snapshot)
-         ), schemas AS (
-           SELECT schema_id, schema_name::text AS full_name, path, path_is_relative
-           FROM ducklake_schema CROSS JOIN chosen_snapshot v
-           WHERE parent_schema_id IS NULL AND begin_snapshot <= v.snapshot_id
-             AND (end_snapshot > v.snapshot_id OR end_snapshot IS NULL)
-           UNION ALL
-           SELECT s.schema_id, p.full_name || '.' || s.schema_name, s.path, s.path_is_relative
-           FROM ducklake_schema s JOIN schemas p ON s.parent_schema_id = p.schema_id
-           CROSS JOIN chosen_snapshot v
-           WHERE s.begin_snapshot <= v.snapshot_id
-             AND (s.end_snapshot > v.snapshot_id OR s.end_snapshot IS NULL)
-         )
+         ), {schemas}
          SELECT t.table_id, t.path, t.path_is_relative,
                 s.path AS schema_path, s.path_is_relative AS schema_relative,
                 v.snapshot_id, v.latest_snapshot,
@@ -586,7 +643,7 @@ async fn table(connection: &mut PgConnection, name: &str, snapshot: Option<i64>)
          WHERE (t.table_name = $1 OR s.full_name || '.' || t.table_name = $1)
            AND t.begin_snapshot <= v.snapshot_id
            AND (t.end_snapshot > v.snapshot_id OR t.end_snapshot IS NULL)",
-    )
+    ))
     .bind(name)
     .bind(snapshot)
     .fetch_all(connection)
