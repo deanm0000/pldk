@@ -1,0 +1,32 @@
+[package]
+name = "pldk"
+version = "0.1.0"
+edition = "2024"
+description = "Read DuckLake catalogs with Polars, without DuckDB"
+license = "MIT"
+
+[lib]
+name = "_pldk"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+polars = { git = "https://github.com/pola-rs/polars", rev = "7f902bd3ffd27ff82d14278a09a295ff2f7aed92", default-features = false, features = ["lazy", "parquet", "dtype-full", "is_in", "is_between", "serde-lazy", "object", "meta", "strings", "abs"] }
+pyo3-polars = { git = "https://github.com/pola-rs/polars", rev = "7f902bd3ffd27ff82d14278a09a295ff2f7aed92", features = ["lazy", "dtype-full"] }
+pyo3 = { version = "0.29", features = ["abi3-py311"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "json"] }
+object_store = { version = "0.14.2", default-features = false, features = ["azure", "ring"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+serde = { version = "1", features = ["derive"] }
+url = "2"
+chrono = "0.4"
+
+[patch.crates-io]
+# Required by the pinned Polars revision's hash-table prefetch calls.
+hashbrown = { git = "https://github.com/pola-rs/hashbrown", rev = "d76a6f81abd8f388676aff15068236a8d21c7e1a" }
+
+[profile.dev]
+debug = 0
+
+[profile.release]
+debug = 0
+codegen-units = 16

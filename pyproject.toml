@@ -1,0 +1,23 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "pldk"
+version = "0.1.0"
+description = "Read-only DuckLake IO plugin for Polars, without DuckDB"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["polars==2.1.0"]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "psycopg[binary]>=3.2", "azure-storage-blob>=12", "pyarrow>=20"]
+
+[tool.maturin]
+python-source = "python"
+module-name = "pldk._pldk"
+features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: requires a PostgreSQL DuckLake catalog and Azure test container"]
